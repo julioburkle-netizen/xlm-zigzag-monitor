@@ -1,12 +1,13 @@
 // ═══════════════════════════════════════════════════════════
-// XLM/USDT ZigZag Monitor — CORREGIDO (sin errores)
-// Solo alertas en 1h, 4h, Diario y Semanal
+// XLM/USDT ZigZag Monitor — Fuente de datos COINGECKO
+// Soluciona el error 451 de Binance en Render
 // ═══════════════════════════════════════════════════════════
 
 const https = require("https");
 const http  = require("http");
 
-const SYMBOL    = "XLMUSDT";
+const SYMBOL    = "xlm"; // Símbolo en CoinGecko
+const VS_CURRENCY = "usdt";
 const TG_TOKEN  = process.env.TG_TOKEN;
 const TG_CHAT   = process.env.TG_CHAT;
 const PCT       = 0.01;
@@ -14,13 +15,24 @@ const MIN_BARS  = 1;
 const POLL_MS   = 2 * 60 * 1000;
 const PORT      = process.env.PORT || 3000;
 
-// SOLO ESTAS TEMPORALIDADES
+// Temporalidades soportadas por CoinGecko (en minutos o dias)
 const TF_CONFIG = {
-  "1h":  { label: "1 Hora",  limit: 800 },
-  "4h":  { label: "4 Horas", limit: 800 },
-  "1d":  { label: "Diario",  limit: 800 },
-  "1w":  { label: "Semanal", limit: 500 },
+  "1h":  { label: "1 Hora",  minutes: 60,   limit: 800 },
+  "4h":  { label: "4 Horas", minutes: 240,  limit: 800 },
+  "1d":  { label: "Diario",  minutes: 1440, limit: 800 },
+  "1w":  { label: "Semanal", minutes: 10080, limit: 500 },
 };
+
+// Intervalos en string para CoinGecko
+function getInterval(minutes) {
+  if (minutes <= 5) return "5m";
+  if (minutes <= 15) return "15m";
+  if (minutes <= 30) return "30m";
+  if (minutes <= 60) return "1h";
+  if (minutes <= 240) return "4h";
+  if (minutes <= 1440) return "1d";
+  return "7d";
+}
 
 let prevPivotCount = {};
 let isFirstRun     = true;
@@ -46,9 +58,10 @@ function fetchJSON(url) {
           return;
         }
         try {
-          resolve(JSON.parse(data));
+          const parsed = JSON.parse(data);
+          resolve(parsed);
         } catch(e) {
-          reject(new Error("JSON parse error"));
+          reject(new Error("JSON parse error: " + data.substring(0, 100)));
         }
       });
     }).on("error", reject);
@@ -93,17 +106,31 @@ async function sendTelegram(msg) {
   }
 }
 
-async function fetchClosedCandles(tf, limit) {
-  const url = `https://api.binance.com/api/v3/klines?symbol=${SYMBOL}&interval=${tf}&limit=${limit}`;
+// ── FUENTE DE DATOS: COINGECKO (sin restricciones) ──
+async function fetchClosedCandles(tf, minutes, limit) {
+  const interval = getInterval(minutes);
+  // CoinGecko OHLC endpoint: /coins/{id}/ohlc?vs_currency=usdt&days=max&interval=hourly
+  // Para periodos largos, usamos 'max' dias y filtramos
+  let days = 365; // suficiente para 1w
+  if (minutes <= 1440) days = 90;
+  if (minutes <= 240) days = 30;
+  if (minutes <= 60) days = 14;
+  
+  const url = `https://api.coingecko.com/api/v3/coins/${SYMBOL}/ohlc?vs_currency=${VS_CURRENCY}&days=${days}&interval=${interval}`;
   const raw = await fetchJSON(url);
   if (!Array.isArray(raw)) {
-    throw new Error("Binance no devolvió un array");
+    throw new Error(`CoinGecko no devolvió array: ${JSON.stringify(raw)}`);
   }
+  // Filtrar velas cerradas (timestamp < ahora)
   const now = Date.now();
-  return raw.filter(k => parseInt(k[6]) < now).map(k => ({
-    h: parseFloat(k[2]),
-    l: parseFloat(k[3]),
-    c: parseFloat(k[4]),
+  const filtered = raw.filter(k => k[0] < now);
+  // Limitar a 'limit' velas
+  const limited = filtered.slice(-limit);
+  // Convertir a formato {h, l, c}
+  return limited.map(k => ({
+    h: Math.max(k[1], k[2], k[3], k[4]), // high: max de open, high, low, close
+    l: Math.min(k[1], k[2], k[3], k[4]), // low: min
+    c: k[4], // close
   }));
 }
 
@@ -140,7 +167,7 @@ async function poll() {
   log("INFO", `── Ciclo ${lastPollTime.toLocaleTimeString("es-AR")} ──`);
   for (const [tf, cfg] of Object.entries(TF_CONFIG)) {
     try {
-      const candles = await fetchClosedCandles(tf, cfg.limit);
+      const candles = await fetchClosedCandles(tf, cfg.minutes, cfg.limit);
       if (candles.length < 5) continue;
       const zz = calcZigZag(candles, PCT, MIN_BARS);
       if (!zz) continue;
@@ -164,14 +191,14 @@ async function poll() {
   }
   if (isFirstRun) {
     isFirstRun = false;
-    log("INFO", "✅ Estado inicial cargado. Alertas activas.");
-    await sendTelegram(`🟢 <b>XLM/USDT ZigZag Monitor ACTIVO</b>\nRetroceso: ${PCT*100}% · Cada 2 min\nTFs: ${Object.values(TF_CONFIG).map(c=>c.label).join(", ")}\n🕐 ${new Date().toLocaleString("es-AR")}`);
+    log("INFO", "✅ Estado inicial cargado. Alertas activas (CoinGecko).");
+    await sendTelegram(`🟢 <b>XLM/USDT ZigZag Monitor ACTIVO (CoinGecko)</b>\nRetroceso: ${PCT*100}% · Cada 2 min\nTFs: ${Object.values(TF_CONFIG).map(c=>c.label).join(", ")}\n🕐 ${new Date().toLocaleString("es-AR")}`);
   }
 }
 
 const server = http.createServer((req, res) => {
   if (req.url === "/health" || req.url === "/") {
-    const data = { status: "✅ corriendo", symbol: SYMBOL, pct: `${PCT*100}%`, lastPoll: lastPollTime ? lastPollTime.toLocaleString("es-AR") : "pendiente", uptime: `${Math.floor(process.uptime()/60)} min`, recentLog: statusLog.slice(0,15) };
+    const data = { status: "✅ corriendo", symbol: "XLM/USDT", source: "CoinGecko", pct: `${PCT*100}%`, lastPoll: lastPollTime ? lastPollTime.toLocaleString("es-AR") : "pendiente", uptime: `${Math.floor(process.uptime()/60)} min`, recentLog: statusLog.slice(0,15) };
     res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
     res.end(JSON.stringify(data, null, 2));
   } else { res.writeHead(404); res.end("Not found"); }
@@ -179,7 +206,7 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, () => {
   log("INFO", `Puerto ${PORT} activo`);
-  log("INFO", "XLM/USDT ZigZag Monitor iniciado (1h,4h,1d,1w)");
+  log("INFO", "XLM/USDT ZigZag Monitor iniciado (CoinGecko - 1h,4h,1d,1w)");
   poll();
   setInterval(poll, POLL_MS);
 });
