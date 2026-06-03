@@ -1,6 +1,7 @@
 // ═══════════════════════════════════════════════════════════
 // XLM/USDT ZigZag Monitor — Servidor Node.js para Render
 // Corre 24/7, no necesita pantalla ni celular encendido
+// VERSION CORREGIDA (maneja errores de Binance)
 // ═══════════════════════════════════════════════════════════
 
 const https = require("https");
@@ -8,8 +9,8 @@ const http  = require("http");
 
 // ── CONFIG ──────────────────────────────────────────────────
 const SYMBOL    = "XLMUSDT";
-const TG_TOKEN  = "8274180473:AAHy2A3sFt3peQWoT41CTOAnXPZwIrznNkQ";
-const TG_CHAT   = "966057563";
+const TG_TOKEN  = process.env.TG_TOKEN;
+const TG_CHAT   = process.env.TG_CHAT;
 const PCT       = 0.01;
 const MIN_BARS  = 1;
 const POLL_MS   = 2 * 60 * 1000;
@@ -47,8 +48,17 @@ function fetchJSON(url) {
       let data = "";
       res.on("data", chunk => data += chunk);
       res.on("end", () => {
-        try { resolve(JSON.parse(data)); }
-        catch(e) { reject(new Error("JSON parse error")); }
+        // Verificar código de estado HTTP
+        if (res.statusCode !== 200) {
+          reject(new Error(`HTTP ${res.statusCode}: ${data}`));
+          return;
+        }
+        try {
+          const parsed = JSON.parse(data);
+          resolve(parsed);
+        } catch(e) {
+          reject(new Error("JSON parse error: " + data.substring(0, 100)));
+        }
       });
     }).on("error", reject);
   });
@@ -83,6 +93,10 @@ function postJSON(url, body) {
 
 // ── TELEGRAM ─────────────────────────────────────────────────
 async function sendTelegram(msg) {
+  if (!TG_TOKEN || !TG_CHAT) {
+    log("ERROR", "Faltan variables TG_TOKEN o TG_CHAT");
+    return false;
+  }
   try {
     const res = await postJSON(
       `https://api.telegram.org/bot${TG_TOKEN}/sendMessage`,
@@ -96,11 +110,17 @@ async function sendTelegram(msg) {
   }
 }
 
-// ── BINANCE — solo velas cerradas ────────────────────────────
+// ── BINANCE — solo velas cerradas (CORREGIDO) ─────────────────
 async function fetchClosedCandles(tf, limit) {
   const url = `https://api.binance.com/api/v3/klines?symbol=${SYMBOL}&interval=${tf}&limit=${limit}`;
-  const raw  = await fetchJSON(url);
-  const now  = Date.now();
+  const raw = await fetchJSON(url);
+  
+  // Si Binance devuelve un objeto de error, raw no será array
+  if (!Array.isArray(raw)) {
+    throw new Error(`Binance devolvió: ${JSON.stringify(raw)}`);
+  }
+  
+  const now = Date.now();
   return raw
     .filter(k => parseInt(k[6]) < now)
     .map(k => ({
@@ -160,8 +180,8 @@ async function poll() {
     try {
       const candles = await fetchClosedCandles(tf, cfg.limit);
 
-      if (candles.length < 5) {
-        log("WARN", `${cfg.label}: solo ${candles.length} velas`);
+      if (!candles || candles.length < 5) {
+        log("WARN", `${cfg.label}: solo ${candles?.length || 0} velas`);
         continue;
       }
 
@@ -236,7 +256,7 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, () => {
   log("INFO", `Puerto ${PORT} activo`);
-  log("INFO", "XLM/USDT ZigZag Monitor iniciado");
+  log("INFO", "XLM/USDT ZigZag Monitor iniciado (versión corregida)");
   poll();
   setInterval(poll, POLL_MS);
 });
