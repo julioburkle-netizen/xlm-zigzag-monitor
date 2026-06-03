@@ -1,7 +1,6 @@
 // ═══════════════════════════════════════════════════════════
 // XLM/USDT ZigZag Monitor — Servidor Node.js para Render
-// Corre 24/7, no necesita pantalla ni celular encendido
-// VERSION CORREGIDA (maneja errores de Binance)
+// Solo alertas en 1h, 4h, Diario y Semanal
 // ═══════════════════════════════════════════════════════════
 
 const https = require("https");
@@ -16,16 +15,12 @@ const MIN_BARS  = 1;
 const POLL_MS   = 2 * 60 * 1000;
 const PORT      = process.env.PORT || 3000;
 
+// SOLO estas temporalidades:
 const TF_CONFIG = {
-  "2m":  { label: "2 Min",   limit: 800 },
-  "5m":  { label: "5 Min",   limit: 800 },
-  "15m": { label: "15 Min",  limit: 800 },
-  "30m": { label: "30 Min",  limit: 800 },
   "1h":  { label: "1 Hora",  limit: 800 },
   "4h":  { label: "4 Horas", limit: 800 },
   "1d":  { label: "Diario",  limit: 800 },
   "1w":  { label: "Semanal", limit: 500 },
-  "1M":  { label: "Mensual", limit: 200 },
 };
 
 let prevPivotCount = {};
@@ -48,7 +43,6 @@ function fetchJSON(url) {
       let data = "";
       res.on("data", chunk => data += chunk);
       res.on("end", () => {
-        // Verificar código de estado HTTP
         if (res.statusCode !== 200) {
           reject(new Error(`HTTP ${res.statusCode}: ${data}`));
           return;
@@ -110,16 +104,13 @@ async function sendTelegram(msg) {
   }
 }
 
-// ── BINANCE — solo velas cerradas (CORREGIDO) ─────────────────
+// ── BINANCE velas cerradas ────────────────────────────────────
 async function fetchClosedCandles(tf, limit) {
   const url = `https://api.binance.com/api/v3/klines?symbol=${SYMBOL}&interval=${tf}&limit=${limit}`;
   const raw = await fetchJSON(url);
-  
-  // Si Binance devuelve un objeto de error, raw no será array
   if (!Array.isArray(raw)) {
     throw new Error(`Binance devolvió: ${JSON.stringify(raw)}`);
   }
-  
   const now = Date.now();
   return raw
     .filter(k => parseInt(k[6]) < now)
@@ -130,7 +121,7 @@ async function fetchClosedCandles(tf, limit) {
     }));
 }
 
-// ── ZIGZAG — lógica idéntica al Pine Script ───────────────────
+// ── ZIGZAG ───────────────────────────────────────────────────
 function calcZigZag(candles, pct, minBars) {
   if (!candles || candles.length < 3) return null;
 
@@ -179,7 +170,6 @@ async function poll() {
   for (const [tf, cfg] of Object.entries(TF_CONFIG)) {
     try {
       const candles = await fetchClosedCandles(tf, cfg.limit);
-
       if (!candles || candles.length < 5) {
         log("WARN", `${cfg.label}: solo ${candles?.length || 0} velas`);
         continue;
@@ -256,7 +246,7 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, () => {
   log("INFO", `Puerto ${PORT} activo`);
-  log("INFO", "XLM/USDT ZigZag Monitor iniciado (versión corregida)");
+  log("INFO", "XLM/USDT ZigZag Monitor iniciado (1h,4h,1d,1w)");
   poll();
   setInterval(poll, POLL_MS);
 });
