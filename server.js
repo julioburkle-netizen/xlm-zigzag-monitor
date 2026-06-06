@@ -52,12 +52,20 @@ function postJSON(url, body) {
     const payload = JSON.stringify(body);
     const u = new URL(url);
     const req = https.request({
-      hostname: u.hostname, path: u.pathname, method: "POST",
-      headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload) },
+      hostname: u.hostname,
+      path: u.pathname,
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(payload)
+      },
     }, (res) => {
       let data = "";
       res.on("data", c => data += c);
-      res.on("end", () => { try { resolve(JSON.parse(data)); } catch(e) { reject(e); } });
+      res.on("end", () => {
+        try { resolve(JSON.parse(data)); }
+        catch(e) { reject(e); }
+      });
     });
     req.on("error", reject);
     req.write(payload);
@@ -102,7 +110,10 @@ function calcZigZag(candles, pct, minBars) {
 
   for (let i = 0; i < candles.length; i++) {
     const { h, l, c } = candles[i];
-    if (isNaN(runHigh)) { runHigh = h; runHighIdx = i; runLow = l; runLowIdx = i; }
+    if (isNaN(runHigh)) {
+      runHigh = h; runHighIdx = i;
+      runLow  = l; runLowIdx  = i;
+    }
     htfBarCount++;
     if (seekHigh) {
       if (h >= runHigh) { runHigh = h; runHighIdx = i; htfBarCount = 0; }
@@ -152,7 +163,6 @@ async function poll() {
   lastPollTime = new Date();
   log("INFO", `── Ciclo ${lastPollTime.toLocaleTimeString("es-AR")} ──`);
 
-  // Procesar TODAS las TFs primero
   for (const [tf, cfg] of Object.entries(TF_CONFIG)) {
     try {
       const candles = await fetchClosedCandles(tf, cfg.limit);
@@ -164,7 +174,6 @@ async function poll() {
       const prev = prevPivotCount[tf] ?? -1;
       const curr = zz.pivotCount;
 
-      // Guardar tendencia ANTES de enviar resumen
       prevTrend[tf] = zz.trend;
 
       if (!isFirstRun && curr > prev && zz.lastPivot) {
@@ -172,7 +181,7 @@ async function poll() {
         const ok  = await sendTelegram(msg);
         const dir = zz.lastPivot.type === "low" ? "ALCISTA" : "BAJISTA";
         log(zz.lastPivot.type === "low" ? "BULL" : "BEAR",
-          `${cfg.label}: ${dir} @ ${zz.lastPivot.price.toFixed(5)} · Telegram ${ok?"✓":"✗"}`);
+          `${cfg.label}: ${dir} @ ${zz.lastPivot.price.toFixed(5)} Telegram ${ok?"OK":"FAIL"}`);
       } else {
         log("INFO", `${cfg.label}: ${zz.trend} · ${curr} pivots`);
       }
@@ -184,12 +193,10 @@ async function poll() {
     }
   }
 
-  // Mandar resumen DESPUÉS de procesar todo (primer ciclo)
   if (isFirstRun) {
     isFirstRun = false;
-    log("INFO", "✅ Estado inicial cargado. Alertas activas.");
+    log("INFO", "Estado inicial cargado. Alertas activas.");
 
-    // Construir resumen con los datos ya cargados
     let msg = `🟢 <b>XLM/USDT ZigZag Monitor ACTIVO</b>\n`;
     msg    += `Render 24/7 · Retroceso: ${PCT * 100}%\n`;
     msg    += `━━━━━━━━━━━━━━━━━━━\n`;
@@ -213,13 +220,12 @@ const server = http.createServer((req, res) => {
     const estado = Object.entries(TF_CONFIG).map(([tf, cfg]) => ({
       tf, label: cfg.label,
       trend:  prevTrend[tf]      || "pendiente",
-      pivots: prevPivotCount[tf] ?? "─",
+      pivots: prevPivotCount[tf] ?? 0,
     }));
     const data = {
-      status:   "✅ corriendo",
-      symbol:   SYMBOL,
-      lastPoll: lastPollTime ? lastPollTime.toLocaleString("es-AR") : "pendiente",
-      uptime:   `${Math.floor(process.uptime() / 60)} min`,
+      status:    "corriendo",
+      lastPoll:  lastPollTime ? lastPollTime.toLocaleString("es-AR") : "pendiente",
+      uptime:    `${Math.floor(process.uptime() / 60)} min`,
       estado,
       recentLog: statusLog.slice(0, 20),
     };
