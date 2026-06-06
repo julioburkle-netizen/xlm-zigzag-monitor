@@ -87,12 +87,19 @@ async function sendTelegram(msg) {
   }
 }
 
+// ── BINANCE con manejo de errores robusto ─────────────────────
 async function fetchClosedCandles(tf, limit) {
   const url = `https://api.binance.com/api/v3/klines?symbol=${SYMBOL}&interval=${tf}&limit=${limit}`;
   const raw  = await fetchJSON(url);
-  const now  = Date.now();
+
+  // Binance a veces devuelve un objeto de error en vez de array
+  if (!Array.isArray(raw)) {
+    throw new Error(`Binance error: ${JSON.stringify(raw)}`);
+  }
+
+  const now = Date.now();
   return raw
-    .filter(k => parseInt(k[6]) < now)
+    .filter(k => Array.isArray(k) && parseInt(k[6]) < now)
     .map(k => ({
       h: parseFloat(k[2]),
       l: parseFloat(k[3]),
@@ -165,8 +172,22 @@ async function poll() {
 
   for (const [tf, cfg] of Object.entries(TF_CONFIG)) {
     try {
-      const candles = await fetchClosedCandles(tf, cfg.limit);
-      if (candles.length < 5) { log("WARN", `${cfg.label}: pocas velas`); continue; }
+      // Reintentar hasta 3 veces si Binance falla
+      let candles = null;
+      for (let intento = 1; intento <= 3; intento++) {
+        try {
+          candles = await fetchClosedCandles(tf, cfg.limit);
+          break;
+        } catch(e) {
+          log("WARN", `${cfg.label}: intento ${intento}/3 fallido — ${e.message}`);
+          if (intento < 3) await new Promise(r => setTimeout(r, 3000));
+        }
+      }
+
+      if (!candles || candles.length < 5) {
+        log("WARN", `${cfg.label}: sin datos válidos`);
+        continue;
+      }
 
       const zz = calcZigZag(candles, PCT, MIN_BARS);
       if (!zz) continue;
