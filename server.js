@@ -1,7 +1,7 @@
 const https = require("https");
 const http  = require("http");
 
-const SYMBOL_KUCOIN = "XLM-USDT";   // KuCoin no tiene restricciones geográficas
+const SYMBOL_KUCOIN = "XLM-USDT";
 const TG_TOKEN = "8274180473:AAHy2A3sFt3peQWoT41CTOAnXPZwIrznNkQ";
 const TG_CHAT  = "966057563";
 const PCT      = 0.01;
@@ -9,9 +9,7 @@ const MIN_BARS = 1;
 const POLL_MS  = 2 * 60 * 1000;
 const PORT     = process.env.PORT || 3000;
 
-// KuCoin intervals
 const TF_CONFIG = {
-  "2min":  { label: "2 Minutos",  interval: "2min",  limit: 800 },
   "5min":  { label: "5 Minutos",  interval: "5min",  limit: 800 },
   "15min": { label: "15 Minutos", interval: "15min", limit: 800 },
   "30min": { label: "30 Minutos", interval: "30min", limit: 800 },
@@ -21,11 +19,11 @@ const TF_CONFIG = {
   "1week": { label: "Semanal",    interval: "1week", limit: 200 },
 };
 
-let prevPivotCount = {};
-let prevTrend      = {};
-let isFirstRun     = true;
+// Estado persistente — guardamos tendencia anterior para detectar cambios
+let prevTrend      = {};   // tendencia del ciclo anterior
 let lastPollTime   = null;
 let statusLog      = [];
+let cycleCount     = 0;
 
 function log(type, msg) {
   const ts = new Date().toLocaleString("es-AR");
@@ -87,32 +85,23 @@ async function sendTelegram(msg) {
   }
 }
 
-// KuCoin API — sin restricciones geográficas
-// Devuelve: [timestamp, open, close, high, low, volume, turnover]
 async function fetchClosedCandles(interval, limit) {
   const url = `https://api.kucoin.com/api/v1/market/candles?type=${interval}&symbol=${SYMBOL_KUCOIN}`;
   const res  = await fetchJSON(url);
-
   if (!res || res.code !== "200000" || !Array.isArray(res.data)) {
-    throw new Error(`KuCoin error: ${JSON.stringify(res)}`);
+    throw new Error(`KuCoin: ${JSON.stringify(res)}`);
   }
-
   const now = Date.now();
-
-  // KuCoin devuelve en orden DESCENDENTE (más reciente primero)
-  // y timestamp en segundos. Invertimos para procesar cronológicamente.
-  const candles = res.data
-    .filter(k => parseInt(k[0]) * 1000 < now)   // solo velas cerradas
+  return res.data
+    .filter(k => parseInt(k[0]) * 1000 < now)
     .map(k => ({
       time: parseInt(k[0]) * 1000,
-      h:    parseFloat(k[3]),   // high
-      l:    parseFloat(k[4]),   // low
-      c:    parseFloat(k[2]),   // close
+      h: parseFloat(k[3]),
+      l: parseFloat(k[4]),
+      c: parseFloat(k[2]),
     }))
-    .reverse()                                    // orden cronológico
-    .slice(-limit);                               // últimas N velas
-
-  return candles;
+    .reverse()
+    .slice(-limit);
 }
 
 function calcZigZag(candles, pct, minBars) {
@@ -149,7 +138,7 @@ function calcZigZag(candles, pct, minBars) {
   return { pivotCount: pivots.length, lastPivot: lp, trend, seekHigh };
 }
 
-function buildAlertMsg(cfg, zz) {
+function buildAlertMsg(cfg, zz, motivo) {
   const lp     = zz.lastPivot;
   const isBull = lp.type === "low";
   const emoji  = isBull ? "📈" : "📉";
@@ -176,61 +165,49 @@ function buildAlertMsg(cfg, zz) {
 
 async function poll() {
   lastPollTime = new Date();
-  log("INFO", `── Ciclo ${lastPollTime.toLocaleTimeString("es-AR")} ──`);
+  cycleCount++;
+  log("INFO", `── Ciclo ${cycleCount} · ${lastPollTime.toLocaleTimeString("es-AR")} ──`);
 
   for (const [tf, cfg] of Object.entries(TF_CONFIG)) {
     try {
       const candles = await fetchClosedCandles(cfg.interval, cfg.limit);
-
       if (!candles || candles.length < 5) {
-        log("WARN", `${cfg.label}: pocas velas (${candles?.length || 0})`);
+        log("WARN", `${cfg.label}: pocas velas`);
         continue;
       }
 
       const zz = calcZigZag(candles, PCT, MIN_BARS);
-      if (!zz) continue;
+      if (!zz || !zz.lastPivot) continue;
 
-      const prev = prevPivotCount[tf] ?? -1;
-      const curr = zz.pivotCount;
+      const trendAnterior = prevTrend[tf];
+      const trendActual   = zz.trend;
 
-      prevTrend[tf] = zz.trend;
+      // ── DETECTAR CAMBIO DE TENDENCIA ──────────────────────
+      // Manda alerta cuando cambia BAJISTA→ALCISTA o ALCISTA→BAJISTA
+      // Funciona aunque el servidor se haya reiniciado porque
+      // compara la tendencia calculada de este ciclo vs el anterior
+      const haySeñal = trendAnterior && trendAnterior !== trendActual;
 
-      if (!isFirstRun && curr > prev && zz.lastPivot) {
+      if (haySeñal) {
         const msg = buildAlertMsg(cfg, zz);
         const ok  = await sendTelegram(msg);
-        const dir = zz.lastPivot.type === "low" ? "ALCISTA" : "BAJISTA";
         log(zz.lastPivot.type === "low" ? "BULL" : "BEAR",
-          `${cfg.label}: ${dir} @ ${zz.lastPivot.price.toFixed(5)} Telegram ${ok?"OK":"FAIL"}`);
-      } else {
-        log("INFO", `${cfg.label}: ${zz.trend} · ${curr} pivots`);
+          `${cfg.label}: CAMBIO ${trendAnterior}→${trendActual} @ ${zz.lastPivot.price.toFixed(5)} Telegram ${ok?"OK":"FAIL"}`);
+      } else if (cycleCount === 1) {
+        // Solo en el primer ciclo loguear el estado inicial, sin telegram
+        log("INFO", `${cfg.label}: ${trendActual} · ${zz.pivotCount} pivots`);
       }
 
-      prevPivotCount[tf] = curr;
+      prevTrend[tf] = trendActual;
 
     } catch(e) {
       log("ERROR", `${cfg.label}: ${e.message}`);
     }
   }
 
-  if (isFirstRun) {
-    isFirstRun = false;
-    log("INFO", "Estado inicial cargado. Alertas activas.");
-
-    let msg = `🟢 <b>XLM/USDT ZigZag Monitor ACTIVO</b>\n`;
-    msg    += `KuCoin · Render 24/7 · Retroceso: ${PCT * 100}%\n`;
-    msg    += `━━━━━━━━━━━━━━━━━━━\n`;
-    msg    += `📊 <b>Estado actual:</b>\n`;
-
-    for (const [tf, cfg] of Object.entries(TF_CONFIG)) {
-      const trend = prevTrend[tf] || "─";
-      const emoji = trend === "ALCISTA" ? "🟢" : trend === "BAJISTA" ? "🔴" : "⚪";
-      msg += `${emoji} ${cfg.label}: <b>${trend}</b>\n`;
-    }
-
-    msg += `━━━━━━━━━━━━━━━━━━━\n`;
-    msg += `🕐 ${new Date().toLocaleString("es-AR")}`;
-
-    await sendTelegram(msg);
+  // Solo en el primer ciclo mandar resumen silencioso de estado
+  if (cycleCount === 1) {
+    log("INFO", "✅ Estado inicial cargado. Monitoreando cambios de tendencia.");
   }
 }
 
@@ -238,14 +215,14 @@ const server = http.createServer((req, res) => {
   if (req.url === "/health" || req.url === "/") {
     const estado = Object.entries(TF_CONFIG).map(([tf, cfg]) => ({
       tf, label: cfg.label,
-      trend:  prevTrend[tf]      || "pendiente",
-      pivots: prevPivotCount[tf] ?? 0,
+      trend: prevTrend[tf] || "pendiente",
     }));
     const data = {
       status:    "corriendo",
       fuente:    "KuCoin",
       lastPoll:  lastPollTime ? lastPollTime.toLocaleString("es-AR") : "pendiente",
       uptime:    `${Math.floor(process.uptime() / 60)} min`,
+      ciclos:    cycleCount,
       estado,
       recentLog: statusLog.slice(0, 20),
     };
@@ -258,8 +235,7 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, () => {
-  log("INFO", `Puerto ${PORT} activo`);
-  log("INFO", "XLM/USDT ZigZag Monitor — KuCoin");
+  log("INFO", `Puerto ${PORT} activo — KuCoin XLM/USDT`);
   poll();
   setInterval(poll, POLL_MS);
 });
