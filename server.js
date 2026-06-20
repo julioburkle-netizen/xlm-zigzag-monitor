@@ -2,25 +2,31 @@ const https = require("https");
 const http  = require("http");
 
 const SYMBOL   = "XLM-USDT";
-const TG_TOKEN = "8274180473:AAHy2A3sFt3peQWoT41CTOAnXPZwIrznNkQ";
-const TG_CHAT  = "966057563";
-const PCT      = 0.01;
-const MIN_BARS = 1;
+
+// 🔐 Credenciales por variable de entorno (configúralas en Render → Environment)
+const TG_TOKEN = process.env.TG_TOKEN || "";
+const TG_CHAT  = process.env.TG_CHAT  || "966057563";
+
+const PCT      = 0.01;   // 1% retroceso para confirmar pivote — igual que "pct" en el Pine
+const MIN_BARS = 1;      // velas mínimas entre pivotes — igual que "minBars" en el Pine
 const POLL_MS  = 30 * 1000;
 const PORT     = process.env.PORT || 3000;
+const HTTP_TIMEOUT_MS = 10 * 1000;
 
-// Solo estas 3 temporalidades
+// Solo estas 3 temporalidades ("limit" = profundidad del histórico SOLO para
+// la primera siembra de estado; después de eso, ya no se usa)
 const TF_CONFIG = {
-  "1hour": { label: "1 Hora",  limit: 800 },
-  "4hour": { label: "4 Horas", limit: 800 },
-  "1day":  { label: "Diario",  limit: 500 },
+  "1hour": { label: "1 Hora",  limit: 800, seconds: 3600  },
+  "4hour": { label: "4 Horas", limit: 800, seconds: 14400 },
+  "1day":  { label: "Diario",  limit: 500, seconds: 86400 },
 };
 
-let state       = {};
+let state       = {};   // state[tf] = estado persistente del ZigZag (igual que los "var" del Pine)
 let lastPoll    = null;
 let statusLog   = [];
 let cycleCount  = 0;
 let initialized = false;
+let isPolling   = false;
 
 function log(type, msg) {
   const ts = new Date().toLocaleString("es-AR");
@@ -29,20 +35,23 @@ function log(type, msg) {
   if (statusLog.length > 200) statusLog.pop();
 }
 
-function fetchJSON(url) {
+// ── HTTP helpers con timeout ──────────────────────────────────────────
+function fetchJSON(url, timeoutMs = HTTP_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
-    https.get(url, { headers: { "User-Agent": "XLM-ZigZag/1.0" } }, (res) => {
+    const req = https.get(url, { headers: { "User-Agent": "XLM-ZigZag/1.0" } }, (res) => {
       let data = "";
       res.on("data", c => data += c);
       res.on("end", () => {
         try { resolve(JSON.parse(data)); }
-        catch(e) { reject(new Error("JSON parse")); }
+        catch (e) { reject(new Error("JSON parse")); }
       });
-    }).on("error", reject);
+    });
+    req.setTimeout(timeoutMs, () => req.destroy(new Error(`Timeout tras ${timeoutMs}ms`)));
+    req.on("error", reject);
   });
 }
 
-function postJSON(url, body) {
+function postJSON(url, body, timeoutMs = HTTP_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     const payload = JSON.stringify(body);
     const u = new URL(url);
@@ -55,14 +64,19 @@ function postJSON(url, body) {
     }, (res) => {
       let data = "";
       res.on("data", c => data += c);
-      res.on("end", () => { try { resolve(JSON.parse(data)); } catch(e) { reject(e); } });
+      res.on("end", () => { try { resolve(JSON.parse(data)); } catch (e) { reject(e); } });
     });
+    req.setTimeout(timeoutMs, () => req.destroy(new Error(`Timeout tras ${timeoutMs}ms`)));
     req.on("error", reject);
     req.write(payload); req.end();
   });
 }
 
 async function sendTelegram(msg) {
+  if (!TG_TOKEN) {
+    log("ERROR", "TG_TOKEN no configurado — alerta NO enviada");
+    return false;
+  }
   try {
     const r = await postJSON(
       `https://api.telegram.org/bot${TG_TOKEN}/sendMessage`,
@@ -70,56 +84,74 @@ async function sendTelegram(msg) {
     );
     if (!r.ok) throw new Error(r.description);
     return true;
-  } catch(e) {
+  } catch (e) {
     log("ERROR", `Telegram: ${e.message}`);
     return false;
   }
 }
 
-async function fetchCandles(interval, limit) {
-  const url = `https://api.kucoin.com/api/v1/market/candles?type=${interval}&symbol=${SYMBOL}`;
-  const res  = await fetchJSON(url);
+// ── Velas: ascendentes, sin la vela en formación, y con "sinceMs" para ──
+// pedir SOLO lo nuevo (igual que el Pine solo procesa "isNewHTFBar") ────
+async function fetchCandles(interval, cfg, sinceMs) {
+  const { seconds, limit } = cfg;
+  const nowSec = Math.floor(Date.now() / 1000);
+  const startAt = sinceMs != null
+    ? Math.floor(sinceMs / 1000) + 1   // solo velas cerradas después de la última procesada
+    : nowSec - limit * seconds;        // primera vez: traer histórico para "sembrar" el estado
+
+  const url = `https://api.kucoin.com/api/v1/market/candles?type=${interval}&symbol=${SYMBOL}&startAt=${startAt}&endAt=${nowSec}`;
+  const res = await fetchJSON(url);
   if (!res || res.code !== "200000" || !Array.isArray(res.data))
     throw new Error(`KuCoin: ${JSON.stringify(res)}`);
-  const now = Date.now();
-  return res.data
-    .filter(k => parseInt(k[0]) * 1000 < now)
-    .map(k => ({ h: parseFloat(k[3]), l: parseFloat(k[4]), c: parseFloat(k[2]) }))
-    .reverse()
-    .slice(-limit);
+
+  const nowMs = Date.now();
+  const candles = res.data
+    .map(k => ({ t: parseInt(k[0]) * 1000, h: parseFloat(k[3]), l: parseFloat(k[4]), c: parseFloat(k[2]) }))
+    .filter(k => k.t + seconds * 1000 <= nowMs)   // excluir vela en curso (por cierre, no apertura)
+    .sort((a, b) => a.t - b.t);                   // orden ascendente: barra por barra, como el Pine
+
+  return sinceMs != null ? candles : candles.slice(-limit);
 }
 
-function calcZigZag(candles) {
-  if (!candles || candles.length < 3) return null;
-  let seekHigh = true;
-  let runHigh = NaN, runLow = NaN;
-  let htfCount = 0;
-  const pivots = [];
+// ── Un paso de ZigZag = un bloque "if isNewHTFBar" del Pine, aplicado ──
+// a UNA vela. El estado (st) persiste entre llamadas — no se recalcula. ─
+function stepZigZag(st, k) {
+  const { t, h, l, c } = k;
+  let pivot = null;
 
-  for (const { h, l, c } of candles) {
-    if (isNaN(runHigh)) { runHigh = h; runLow = l; }
-    htfCount++;
-    if (seekHigh) {
-      if (h >= runHigh) { runHigh = h; htfCount = 0; }
-    } else {
-      if (l <= runLow)  { runLow  = l; htfCount = 0; }
-    }
-    if (seekHigh && htfCount >= MIN_BARS && c < runHigh * (1 - PCT)) {
-      pivots.push({ type: "high", price: runHigh });
-      seekHigh = false; runLow = l; htfCount = 0;
-    } else if (!seekHigh && htfCount >= MIN_BARS && c > runLow * (1 + PCT)) {
-      pivots.push({ type: "low", price: runLow });
-      seekHigh = true; runHigh = h; htfCount = 0;
-    }
+  if (st.runHigh === null) {
+    st.runHigh = h; st.runHighTime = t;
+    st.runLow  = l; st.runLowTime  = t;
   }
 
-  const lp    = pivots[pivots.length - 1] || null;
-  const trend = pivots.length > 0 ? (seekHigh ? "ALCISTA" : "BAJISTA") : "NEUTRAL";
-  return { pivotCount: pivots.length, lastPivot: lp, trend };
+  st.htfBarCount++;
+
+  if (st.seekHigh) {
+    if (h >= st.runHigh) { st.runHigh = h; st.runHighTime = t; st.htfBarCount = 0; }
+  } else {
+    if (l <= st.runLow)  { st.runLow  = l; st.runLowTime  = t; st.htfBarCount = 0; }
+  }
+
+  if (st.seekHigh && st.htfBarCount >= MIN_BARS && c < st.runHigh * (1 - PCT)) {
+    pivot = { type: "high", price: st.runHigh, time: st.runHighTime };
+    st.lastPrice   = st.runHigh;
+    st.lastWasHigh = true;
+    st.seekHigh    = false;
+    st.runLow      = l; st.runLowTime = t;
+    st.htfBarCount = 0;
+  } else if (!st.seekHigh && st.htfBarCount >= MIN_BARS && c > st.runLow * (1 + PCT)) {
+    pivot = { type: "low", price: st.runLow, time: st.runLowTime };
+    st.lastPrice   = st.runLow;
+    st.lastWasHigh = false;
+    st.seekHigh    = true;
+    st.runHigh     = h; st.runHighTime = t;
+    st.htfBarCount = 0;
+  }
+
+  return pivot;
 }
 
-function buildMsg(cfg, zz) {
-  const lp     = zz.lastPivot;
+function buildMsg(cfg, lp) {
   const isBull = lp.type === "low";
   const emoji  = isBull ? "📈" : "📉";
   const señal  = isBull ? "🟢 SEÑAL ALCISTA" : "🔴 SEÑAL BAJISTA";
@@ -143,78 +175,97 @@ function buildMsg(cfg, zz) {
   );
 }
 
+// ── Procesa UNA temporalidad: solo las velas nuevas desde la última vez ─
+async function processTimeframe(tf, cfg) {
+  const seeding = !state[tf];
+  const st = state[tf] || {
+    seekHigh: true,
+    runHigh: null, runLow: null,
+    runHighTime: null, runLowTime: null,
+    htfBarCount: 0,
+    lastPrice: null, lastWasHigh: false,
+    pivotCount: 0,
+    lastProcessedTime: null,
+  };
+
+  const candles = await fetchCandles(tf, cfg, st.lastProcessedTime);
+
+  if (candles.length === 0) {
+    state[tf] = st;
+    return; // nada nuevo cerró todavía — exactamente como "not isNewHTFBar" en el Pine
+  }
+
+  const newPivots = [];
+  for (const k of candles) {
+    const pivot = stepZigZag(st, k);
+    st.lastProcessedTime = k.t;
+    if (pivot) { st.pivotCount++; newPivots.push(pivot); }
+  }
+  state[tf] = st;
+
+  if (seeding) {
+    // Al iniciar, se "siembra" el estado con el histórico, sin alertar —
+    // igual que cuando cargás el indicador por primera vez en TradingView.
+    log("INFO", `${cfg.label}: estado inicial sembrado · ${st.pivotCount}p históricos · ${candles.length} velas · último ${st.lastWasHigh ? "▼MAX" : "▲MIN"} @ ${st.lastPrice?.toFixed(5) ?? "—"}`);
+    return;
+  }
+
+  for (const pivot of newPivots) {
+    const msg = buildMsg(cfg, pivot);
+    const ok  = await sendTelegram(msg);
+    log(pivot.type === "low" ? "BULL" : "BEAR",
+      `${cfg.label}: nuevo pivote ${pivot.type === "low" ? "▲MIN" : "▼MAX"} @ ${pivot.price.toFixed(5)} · Telegram ${ok ? "OK" : "FAIL"}`);
+  }
+}
+
 async function poll() {
+  if (isPolling) {
+    log("WARN", "Ciclo anterior aún en curso — se omite este poll");
+    return;
+  }
+  isPolling = true;
   lastPoll = new Date();
   cycleCount++;
 
-  for (const [tf, cfg] of Object.entries(TF_CONFIG)) {
-    try {
-      const candles = await fetchCandles(tf, cfg.limit);
-      if (!candles || candles.length < 5) continue;
-
-      const zz = calcZigZag(candles);
-      if (!zz || !zz.lastPivot) continue;
-
-      const prev = state[tf];
-
-      if (!prev) {
-        state[tf] = {
-          pivotCount:     zz.pivotCount,
-          lastPivotPrice: zz.lastPivot.price,
-          lastPivotType:  zz.lastPivot.type,
-          trend:          zz.trend,
-        };
-        log("INFO", `${cfg.label}: init · ${zz.trend} · ${zz.pivotCount}p · ${zz.lastPivot.type} @ ${zz.lastPivot.price.toFixed(5)}`);
-        continue;
+  try {
+    for (const [tf, cfg] of Object.entries(TF_CONFIG)) {
+      try {
+        await processTimeframe(tf, cfg);
+      } catch (e) {
+        log("ERROR", `${cfg.label}: ${e.message}`);
       }
-
-      const nuevoContador = zz.pivotCount > prev.pivotCount;
-      const nuevoPrecio   = zz.lastPivot.price !== prev.lastPivotPrice;
-      const nuevoTipo     = zz.lastPivot.type  !== prev.lastPivotType;
-
-      if (nuevoContador || (nuevoPrecio && nuevoTipo)) {
-        const msg = buildMsg(cfg, zz);
-        const ok  = await sendTelegram(msg);
-        log(zz.lastPivot.type === "low" ? "BULL" : "BEAR",
-          `${cfg.label}: ${zz.trend} @ ${zz.lastPivot.price.toFixed(5)} · Telegram ${ok?"OK":"FAIL"}`);
-      }
-
-      state[tf] = {
-        pivotCount:     zz.pivotCount,
-        lastPivotPrice: zz.lastPivot.price,
-        lastPivotType:  zz.lastPivot.type,
-        trend:          zz.trend,
-      };
-
-    } catch(e) {
-      log("ERROR", `${cfg.label}: ${e.message}`);
     }
-  }
-
-  if (!initialized) {
-    initialized = true;
-    log("INFO", "Monitoreando 1H · 4H · Diario · cada 30 segundos");
+    if (!initialized) {
+      initialized = true;
+      log("INFO", "Monitoreando 1H · 4H · Diario · cada 30s · motor incremental (igual que TradingView)");
+    }
+  } finally {
+    isPolling = false;
   }
 }
 
 const server = http.createServer((req, res) => {
   if (req.url === "/health" || req.url === "/") {
-    const estado = Object.entries(TF_CONFIG).map(([tf, cfg]) => ({
-      label:  cfg.label,
-      trend:  state[tf]?.trend || "─",
-      pivots: state[tf]?.pivotCount || 0,
-      ultimo: state[tf]
-        ? `${state[tf].lastPivotType === "low" ? "▲MIN" : "▼MAX"} @ ${state[tf].lastPivotPrice?.toFixed(5)}`
-        : "─",
-    }));
+    const estado = Object.entries(TF_CONFIG).map(([tf, cfg]) => {
+      const st = state[tf];
+      return {
+        label:  cfg.label,
+        trend:  st ? (st.seekHigh ? "ALCISTA" : "BAJISTA") : "─",
+        pivots: st?.pivotCount || 0,
+        ultimo: st && st.lastPrice != null
+          ? `${st.lastWasHigh ? "▼MAX" : "▲MIN"} @ ${st.lastPrice.toFixed(5)}`
+          : "─",
+      };
+    });
     res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
     res.end(JSON.stringify({
-      status:   "corriendo",
-      lastPoll: lastPoll?.toLocaleString("es-AR") || "─",
-      uptime:   `${Math.floor(process.uptime() / 60)} min`,
-      ciclos:   cycleCount,
+      status:        "corriendo",
+      telegramListo: !!TG_TOKEN,
+      lastPoll:      lastPoll?.toLocaleString("es-AR") || "─",
+      uptime:        `${Math.floor(process.uptime() / 60)} min`,
+      ciclos:        cycleCount,
       estado,
-      log:      statusLog.slice(0, 15),
+      log:           statusLog.slice(0, 15),
     }, null, 2));
   } else {
     res.writeHead(404); res.end("Not found");
@@ -222,6 +273,9 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, () => {
+  if (!TG_TOKEN) {
+    log("ERROR", "⚠ Falta variable de entorno TG_TOKEN — configúrala en Render. Las alertas de Telegram NO se enviarán hasta entonces.");
+  }
   log("INFO", `Puerto ${PORT} · XLM/USDT · 1H 4H Diario`);
   poll();
   setInterval(poll, POLL_MS);
