@@ -1,27 +1,38 @@
 const https = require("https");
 const http  = require("http");
 
-const SYMBOL   = "XLM-USDT";
-
 // 🔐 Credenciales por variable de entorno (configúralas en Render → Environment)
 const TG_TOKEN = process.env.TG_TOKEN || "";
 const TG_CHAT  = process.env.TG_CHAT  || "966057563";
 
-const PCT      = 0.01;   // 1% retroceso para confirmar pivote — igual que "pct" en el Pine
-const MIN_BARS = 1;      // velas mínimas entre pivotes — igual que "minBars" en el Pine
+const PCT      = 0.01;   // 1% retroceso para confirmar pivote
+const MIN_BARS = 1;      // velas mínimas entre pivotes
 const POLL_MS  = 30 * 1000;
 const PORT     = process.env.PORT || 3000;
 const HTTP_TIMEOUT_MS = 10 * 1000;
 
-// Solo estas 3 temporalidades ("limit" = profundidad del histórico SOLO para
-// la primera siembra de estado; después de eso, ya no se usa)
-const TF_CONFIG = {
-  "1hour": { label: "1 Hora",  limit: 800, seconds: 3600  },
-  "4hour": { label: "4 Horas", limit: 800, seconds: 14400 },
-  "1day":  { label: "Diario",  limit: 500, seconds: 86400 },
+// ══════════════════════════════════════════════════════════════════════
+//   📌 PARES A MONITOREAR — agrega/quita líneas aquí
+// ══════════════════════════════════════════════════════════════════════
+const MONITORS = [
+  { id: "xlm", pairLabel: "XLM/USDT",        exchangeLabel: "KuCoin", exchange: "kucoin", symbol: "XLM-USDT" },
+  { id: "a",   pairLabel: "A/USDT (Vaulta)", exchangeLabel: "LBank",  exchange: "lbank",  symbol: "a_usdt"   },
+];
+
+// Temporalidades (neutrales) + cuánto histórico pedir al "sembrar" el estado
+const TF_DEFS = {
+  "1h": { label: "1 Hora",  seconds: 3600,  limit: 800 },
+  "4h": { label: "4 Horas", seconds: 14400, limit: 800 },
+  "1d": { label: "Diario",  seconds: 86400, limit: 500 },
 };
 
-let state       = {};   // state[tf] = estado persistente del ZigZag (igual que los "var" del Pine)
+// Cómo se llama cada temporalidad en la API de cada exchange
+const TF_NAME = {
+  kucoin: { "1h": "1hour", "4h": "4hour", "1d": "1day" },
+  lbank:  { "1h": "hour1", "4h": "hour4", "1d": "day1" },
+};
+
+let state       = {};   // state["xlm:1h"] = estado persistente del ZigZag para ese par+tf
 let lastPoll    = null;
 let statusLog   = [];
 let cycleCount  = 0;
@@ -38,7 +49,7 @@ function log(type, msg) {
 // ── HTTP helpers con timeout ──────────────────────────────────────────
 function fetchJSON(url, timeoutMs = HTTP_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
-    const req = https.get(url, { headers: { "User-Agent": "XLM-ZigZag/1.0" } }, (res) => {
+    const req = https.get(url, { headers: { "User-Agent": "Multi-ZigZag/1.0" } }, (res) => {
       let data = "";
       res.on("data", c => data += c);
       res.on("end", () => {
@@ -90,16 +101,15 @@ async function sendTelegram(msg) {
   }
 }
 
-// ── Velas: ascendentes, sin la vela en formación, y con "sinceMs" para ──
-// pedir SOLO lo nuevo (igual que el Pine solo procesa "isNewHTFBar") ────
-async function fetchCandles(interval, cfg, sinceMs) {
+// ── KuCoin: velas ascendentes, sin la vela en formación ────────────────
+async function fetchCandlesKuCoin(symbol, interval, cfg, sinceMs) {
   const { seconds, limit } = cfg;
   const nowSec = Math.floor(Date.now() / 1000);
   const startAt = sinceMs != null
-    ? Math.floor(sinceMs / 1000) + 1   // solo velas cerradas después de la última procesada
-    : nowSec - limit * seconds;        // primera vez: traer histórico para "sembrar" el estado
+    ? Math.floor(sinceMs / 1000) + 1
+    : nowSec - limit * seconds;
 
-  const url = `https://api.kucoin.com/api/v1/market/candles?type=${interval}&symbol=${SYMBOL}&startAt=${startAt}&endAt=${nowSec}`;
+  const url = `https://api.kucoin.com/api/v1/market/candles?type=${interval}&symbol=${symbol}&startAt=${startAt}&endAt=${nowSec}`;
   const res = await fetchJSON(url);
   if (!res || res.code !== "200000" || !Array.isArray(res.data))
     throw new Error(`KuCoin: ${JSON.stringify(res)}`);
@@ -107,14 +117,43 @@ async function fetchCandles(interval, cfg, sinceMs) {
   const nowMs = Date.now();
   const candles = res.data
     .map(k => ({ t: parseInt(k[0]) * 1000, h: parseFloat(k[3]), l: parseFloat(k[4]), c: parseFloat(k[2]) }))
-    .filter(k => k.t + seconds * 1000 <= nowMs)   // excluir vela en curso (por cierre, no apertura)
-    .sort((a, b) => a.t - b.t);                   // orden ascendente: barra por barra, como el Pine
+    .filter(k => k.t + seconds * 1000 <= nowMs)
+    .sort((a, b) => a.t - b.t);
 
   return sinceMs != null ? candles : candles.slice(-limit);
 }
 
-// ── Un paso de ZigZag = un bloque "if isNewHTFBar" del Pine, aplicado ──
-// a UNA vela. El estado (st) persiste entre llamadas — no se recalcula. ─
+// ── LBank: formato y endpoint distintos. El parámetro "time" de LBank ──
+// no filtra de forma confiable (bug conocido de su API), así que SIEMPRE
+// se filtra localmente por sinceMs en vez de confiar en el rango pedido.
+async function fetchCandlesLBank(symbol, type, cfg, sinceMs) {
+  const { seconds, limit } = cfg;
+  const size = sinceMs != null ? 50 : limit; // si ya hay estado, alcanza con pocas velas recientes
+  const nowSec = Math.floor(Date.now() / 1000);
+  const url = `https://api.lbkex.com/v1/kline.do?symbol=${symbol}&size=${size}&type=${type}&time=${nowSec}`;
+  const res = await fetchJSON(url);
+  if (!Array.isArray(res)) throw new Error(`LBank: ${JSON.stringify(res)}`);
+
+  const nowMs = Date.now();
+  let candles = res
+    // formato LBank: [tiempo(seg), open, high, low, close, volumen]
+    .map(k => ({ t: k[0] * 1000, h: k[2], l: k[3], c: k[4] }))
+    .filter(k => k.t + seconds * 1000 <= nowMs)
+    .sort((a, b) => a.t - b.t);
+
+  if (sinceMs != null) candles = candles.filter(k => k.t > sinceMs);
+  return sinceMs != null ? candles : candles.slice(-limit);
+}
+
+async function fetchCandles(monitor, tfKey, cfg, sinceMs) {
+  const interval = TF_NAME[monitor.exchange][tfKey];
+  if (monitor.exchange === "kucoin") return fetchCandlesKuCoin(monitor.symbol, interval, cfg, sinceMs);
+  if (monitor.exchange === "lbank")  return fetchCandlesLBank(monitor.symbol, interval, cfg, sinceMs);
+  throw new Error(`Exchange desconocido: ${monitor.exchange}`);
+}
+
+// ── Un paso de ZigZag, igual lógica que el Pine: estado persistente, ──
+// se avanza vela por vela, nunca se recalcula desde cero. ─────────────
 function stepZigZag(st, k) {
   const { t, h, l, c } = k;
   let pivot = null;
@@ -151,7 +190,7 @@ function stepZigZag(st, k) {
   return pivot;
 }
 
-function buildMsg(cfg, lp) {
+function buildMsg(monitor, cfg, lp) {
   const isBull = lp.type === "low";
   const emoji  = isBull ? "📈" : "📉";
   const señal  = isBull ? "🟢 SEÑAL ALCISTA" : "🔴 SEÑAL BAJISTA";
@@ -163,7 +202,7 @@ function buildMsg(cfg, lp) {
   return (
     `${emoji} <b>${señal}</b>\n` +
     `━━━━━━━━━━━━━━━━━━━\n` +
-    `📊 Par: <b>XLM/USDT</b>\n` +
+    `📊 Par: <b>${monitor.pairLabel}</b> (${monitor.exchangeLabel})\n` +
     `⏱ Temporalidad: <b>${cfg.label}</b>\n` +
     `━━━━━━━━━━━━━━━━━━━\n` +
     `〽️ ZigZag: <b>${pivot}</b>\n` +
@@ -175,10 +214,12 @@ function buildMsg(cfg, lp) {
   );
 }
 
-// ── Procesa UNA temporalidad: solo las velas nuevas desde la última vez ─
-async function processTimeframe(tf, cfg) {
-  const seeding = !state[tf];
-  const st = state[tf] || {
+// ── Procesa UNA temporalidad de UN par: solo velas nuevas desde la ──
+// última vez. El estado vive en state[`${monitor.id}:${tfKey}`]. ────
+async function processTimeframe(monitor, tfKey, cfg) {
+  const key     = `${monitor.id}:${tfKey}`;
+  const seeding = !state[key];
+  const st = state[key] || {
     seekHigh: true,
     runHigh: null, runLow: null,
     runHighTime: null, runLowTime: null,
@@ -188,11 +229,11 @@ async function processTimeframe(tf, cfg) {
     lastProcessedTime: null,
   };
 
-  const candles = await fetchCandles(tf, cfg, st.lastProcessedTime);
+  const candles = await fetchCandles(monitor, tfKey, cfg, st.lastProcessedTime);
 
   if (candles.length === 0) {
-    state[tf] = st;
-    return; // nada nuevo cerró todavía — exactamente como "not isNewHTFBar" en el Pine
+    state[key] = st;
+    return;
   }
 
   const newPivots = [];
@@ -201,20 +242,18 @@ async function processTimeframe(tf, cfg) {
     st.lastProcessedTime = k.t;
     if (pivot) { st.pivotCount++; newPivots.push(pivot); }
   }
-  state[tf] = st;
+  state[key] = st;
 
   if (seeding) {
-    // Al iniciar, se "siembra" el estado con el histórico, sin alertar —
-    // igual que cuando cargás el indicador por primera vez en TradingView.
-    log("INFO", `${cfg.label}: estado inicial sembrado · ${st.pivotCount}p históricos · ${candles.length} velas · último ${st.lastWasHigh ? "▼MAX" : "▲MIN"} @ ${st.lastPrice?.toFixed(5) ?? "—"}`);
+    log("INFO", `${monitor.pairLabel} ${cfg.label}: estado sembrado · ${st.pivotCount}p históricos · ${candles.length} velas · último ${st.lastWasHigh ? "▼MAX" : "▲MIN"} @ ${st.lastPrice?.toFixed(5) ?? "—"}`);
     return;
   }
 
   for (const pivot of newPivots) {
-    const msg = buildMsg(cfg, pivot);
+    const msg = buildMsg(monitor, cfg, pivot);
     const ok  = await sendTelegram(msg);
     log(pivot.type === "low" ? "BULL" : "BEAR",
-      `${cfg.label}: nuevo pivote ${pivot.type === "low" ? "▲MIN" : "▼MAX"} @ ${pivot.price.toFixed(5)} · Telegram ${ok ? "OK" : "FAIL"}`);
+      `${monitor.pairLabel} ${cfg.label}: nuevo pivote ${pivot.type === "low" ? "▲MIN" : "▼MAX"} @ ${pivot.price.toFixed(5)} · Telegram ${ok ? "OK" : "FAIL"}`);
   }
 }
 
@@ -228,16 +267,18 @@ async function poll() {
   cycleCount++;
 
   try {
-    for (const [tf, cfg] of Object.entries(TF_CONFIG)) {
-      try {
-        await processTimeframe(tf, cfg);
-      } catch (e) {
-        log("ERROR", `${cfg.label}: ${e.message}`);
+    for (const monitor of MONITORS) {
+      for (const [tfKey, cfg] of Object.entries(TF_DEFS)) {
+        try {
+          await processTimeframe(monitor, tfKey, cfg);
+        } catch (e) {
+          log("ERROR", `${monitor.pairLabel} ${cfg.label}: ${e.message}`);
+        }
       }
     }
     if (!initialized) {
       initialized = true;
-      log("INFO", "Monitoreando 1H · 4H · Diario · cada 30s · motor incremental (igual que TradingView)");
+      log("INFO", `Monitoreando ${MONITORS.map(m => m.pairLabel).join(" · ")} · 1H/4H/Diario · cada 30s`);
     }
   } finally {
     isPolling = false;
@@ -246,17 +287,21 @@ async function poll() {
 
 const server = http.createServer((req, res) => {
   if (req.url === "/health" || req.url === "/") {
-    const estado = Object.entries(TF_CONFIG).map(([tf, cfg]) => {
-      const st = state[tf];
-      return {
-        label:  cfg.label,
-        trend:  st ? (st.seekHigh ? "ALCISTA" : "BAJISTA") : "─",
-        pivots: st?.pivotCount || 0,
-        ultimo: st && st.lastPrice != null
-          ? `${st.lastWasHigh ? "▼MAX" : "▲MIN"} @ ${st.lastPrice.toFixed(5)}`
-          : "─",
-      };
-    });
+    const estado = [];
+    for (const monitor of MONITORS) {
+      for (const [tfKey, cfg] of Object.entries(TF_DEFS)) {
+        const st = state[`${monitor.id}:${tfKey}`];
+        estado.push({
+          par:    `${monitor.pairLabel} (${monitor.exchangeLabel})`,
+          tf:     cfg.label,
+          trend:  st ? (st.seekHigh ? "ALCISTA" : "BAJISTA") : "─",
+          pivots: st?.pivotCount || 0,
+          ultimo: st && st.lastPrice != null
+            ? `${st.lastWasHigh ? "▼MAX" : "▲MIN"} @ ${st.lastPrice.toFixed(5)}`
+            : "─",
+        });
+      }
+    }
     res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
     res.end(JSON.stringify({
       status:        "corriendo",
@@ -265,7 +310,7 @@ const server = http.createServer((req, res) => {
       uptime:        `${Math.floor(process.uptime() / 60)} min`,
       ciclos:        cycleCount,
       estado,
-      log:           statusLog.slice(0, 15),
+      log:           statusLog.slice(0, 20),
     }, null, 2));
   } else {
     res.writeHead(404); res.end("Not found");
@@ -274,9 +319,9 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, () => {
   if (!TG_TOKEN) {
-    log("ERROR", "⚠ Falta variable de entorno TG_TOKEN — configúrala en Render. Las alertas de Telegram NO se enviarán hasta entonces.");
+    log("ERROR", "⚠ Falta variable de entorno TG_TOKEN — configúrala en Render.");
   }
-  log("INFO", `Puerto ${PORT} · XLM/USDT · 1H 4H Diario`);
+  log("INFO", `Puerto ${PORT} · ${MONITORS.map(m => m.pairLabel).join(" · ")}`);
   poll();
   setInterval(poll, POLL_MS);
 });
