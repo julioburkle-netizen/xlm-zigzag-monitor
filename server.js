@@ -141,7 +141,12 @@ async function fetchCandlesLBank(symbol, type, cfg, sinceMs) {
   const { seconds, limit } = cfg;
   const size = sinceMs != null ? 50 : limit; // si ya hay estado, alcanza con pocas velas recientes
   const nowSec = Math.floor(Date.now() / 1000);
-  const url = `https://api.lbkex.com/v1/kline.do?symbol=${symbol}&size=${size}&type=${type}&time=${nowSec}`;
+  // 🐛 Bug confirmado de LBank: si "time" está muy cerca de "ahora", la
+  // respuesta vuelve truncada a 1 sola vela, sin importar el símbolo ni
+  // el "size" pedido. Alejándolo 24hs del presente, siempre devuelve las
+  // velas más recientes completas (confirmado con eth_usdt y a_usdt).
+  const timeSafe = nowSec - 24 * 3600;
+  const url = `https://api.lbkex.com/v1/kline.do?symbol=${symbol}&size=${size}&type=${type}&time=${timeSafe}`;
   const res = await fetchJSON(url);
   if (!Array.isArray(res)) throw new Error(`LBank: ${JSON.stringify(res)}`);
 
