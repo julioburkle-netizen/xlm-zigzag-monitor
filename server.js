@@ -387,18 +387,28 @@ const server = http.createServer(async (req, res) => {
       log:           statusLog.slice(0, 20),
     }, null, 2));
   } else if (req.url.startsWith("/debug-lbank-kline")) {
-    // Llama directamente a kline.do con los mismos parámetros que usa el
-    // bot, y devuelve la respuesta CRUDA — sin filtrar ni interpretar —
-    // para ver exactamente qué está contestando LBank.
+    // Llama directamente a kline.do — todo configurable por query params
+    // para poder probar combinaciones sin tener que subir código de nuevo.
+    // Ej: /debug-lbank-kline?time=hace24h  ó  /debug-lbank-kline?symbol=eth_usdt
     try {
-      const u       = new URL(req.url, "http://localhost");
-      const tipo    = u.searchParams.get("type") || "hour1";
-      const nowSec  = Math.floor(Date.now() / 1000);
-      const url     = `https://api.lbkex.com/v1/kline.do?symbol=a_usdt&size=20&type=${tipo}&time=${nowSec}`;
-      const crudo   = await fetchJSON(url);
+      const u      = new URL(req.url, "http://localhost");
+      const symbol = u.searchParams.get("symbol") || "a_usdt";
+      const tipo   = u.searchParams.get("type")   || "hour1";
+      const size   = u.searchParams.get("size")   || "20";
+      const nowSec = Math.floor(Date.now() / 1000);
+
+      let timeParam = u.searchParams.get("time") || String(nowSec);
+      if (timeParam === "hace24h")  timeParam = String(nowSec - 24 * 3600);
+      if (timeParam === "hace7d")   timeParam = String(nowSec - 7 * 86400);
+      if (timeParam === "hace30d")  timeParam = String(nowSec - 30 * 86400);
+
+      const url   = `https://api.lbkex.com/v1/kline.do?symbol=${symbol}&size=${size}&type=${tipo}&time=${timeParam}`;
+      const crudo = await fetchJSON(url);
       res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
       res.end(JSON.stringify({
         urlConsultada: url,
+        timeUsado: timeParam,
+        nowSec,
         esArray: Array.isArray(crudo),
         cantidadDeVelas: Array.isArray(crudo) ? crudo.length : null,
         respuestaCruda: crudo,
