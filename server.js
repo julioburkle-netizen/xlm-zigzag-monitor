@@ -386,6 +386,27 @@ const server = http.createServer(async (req, res) => {
       estado,
       log:           statusLog.slice(0, 20),
     }, null, 2));
+  } else if (req.url.startsWith("/debug-lbank-kline")) {
+    // Llama directamente a kline.do con los mismos parámetros que usa el
+    // bot, y devuelve la respuesta CRUDA — sin filtrar ni interpretar —
+    // para ver exactamente qué está contestando LBank.
+    try {
+      const u       = new URL(req.url, "http://localhost");
+      const tipo    = u.searchParams.get("type") || "hour1";
+      const nowSec  = Math.floor(Date.now() / 1000);
+      const url     = `https://api.lbkex.com/v1/kline.do?symbol=a_usdt&size=20&type=${tipo}&time=${nowSec}`;
+      const crudo   = await fetchJSON(url);
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({
+        urlConsultada: url,
+        esArray: Array.isArray(crudo),
+        cantidadDeVelas: Array.isArray(crudo) ? crudo.length : null,
+        respuestaCruda: crudo,
+      }, null, 2));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ error: e.message }));
+    }
   } else if (req.url.startsWith("/debug-lbank")) {
     // Verifica directamente contra LBank si el símbolo configurado existe.
     try {
