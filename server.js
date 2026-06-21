@@ -243,6 +243,13 @@ async function processTimeframe(monitor, tfKey, cfg) {
   const candles = await fetchCandles(monitor, tfKey, cfg, st.lastProcessedTime);
 
   if (candles.length === 0) {
+    if (st.lastProcessedTime === null) {
+      // Nunca se procesó ni una sola vela para este par+tf — esto NO es
+      // normal pasados unos minutos. Avisa en cada ciclo hasta que se
+      // resuelva (símbolo inválido, par no soportado, etc.), en vez de
+      // quedar en silencio para siempre como antes.
+      log("WARN", `${monitor.pairLabel} ${cfg.label}: 0 velas recibidas (nunca se procesó ninguna) — revisa /debug-lbank`);
+    }
     state[key] = st;
     return;
   }
@@ -296,7 +303,63 @@ async function poll() {
   }
 }
 
-const server = http.createServer((req, res) => {
+// ── Backtest: ¿qué % de los tramos pivote→pivote llegó a cierto objetivo? ──
+// Recalcula el ZigZag completo sobre el histórico (en una copia de estado
+// aparte, sin tocar el state[] en vivo) y mide el movimiento real en %
+// entre cada pivote y el siguiente — no solo cuántas velas hubo.
+async function backtestLegs(monitor, tfKey) {
+  const cfg = TF_DEFS[tfKey];
+  const candles = await fetchCandles(monitor, tfKey, cfg, null); // null = histórico completo
+
+  const st = {
+    seekHigh: true, runHigh: null, runLow: null,
+    runHighTime: null, runLowTime: null, htfBarCount: 0,
+    lastPrice: null, lastWasHigh: false, pivotCount: 0, lastProcessedTime: null,
+  };
+  const pivots = [];
+  for (const k of candles) {
+    const pivot = stepZigZag(st, k);
+    if (pivot) pivots.push(pivot);
+  }
+
+  const legs = [];
+  for (let i = 1; i < pivots.length; i++) {
+    const prev = pivots[i - 1], curr = pivots[i];
+    const pct = Math.abs((curr.price - prev.price) / prev.price) * 100;
+    legs.push(Math.round(pct * 100) / 100);
+  }
+
+  const total = legs.length;
+  const buckets = { "menor a 1%": 0, "1% a 2%": 0, "2% a 4%": 0, "4% a 8%": 0, "8% o más": 0 };
+  let suma = 0, max = 0, llegaA4 = 0;
+  for (const pct of legs) {
+    suma += pct;
+    if (pct > max) max = pct;
+    if (pct >= 4) llegaA4++;
+    if (pct < 1) buckets["menor a 1%"]++;
+    else if (pct < 2) buckets["1% a 2%"]++;
+    else if (pct < 4) buckets["2% a 4%"]++;
+    else if (pct < 8) buckets["4% a 8%"]++;
+    else buckets["8% o más"]++;
+  }
+  const ordenados = [...legs].sort((a, b) => a - b);
+  const mediana = total ? ordenados[Math.floor(total / 2)] : 0;
+
+  return {
+    par:                     `${monitor.pairLabel} (${monitor.exchangeLabel})`,
+    temporalidad:            cfg.label,
+    velasAnalizadas:         candles.length,
+    tramosPivoteAPivote:     total,
+    tramosQueLlegaronA4pct:  llegaA4,
+    porcentajeQueLlegaA4pct: total ? `${((llegaA4 / total) * 100).toFixed(1)}%` : "0%",
+    movimientoPromedio:      `${(total ? suma / total : 0).toFixed(2)}%`,
+    movimientoMediana:       `${mediana.toFixed(2)}%`,
+    movimientoMaximo:        `${max.toFixed(2)}%`,
+    distribucion:            buckets,
+  };
+}
+
+const server = http.createServer(async (req, res) => {
   if (req.url === "/health" || req.url === "/") {
     const estado = [];
     for (const monitor of MONITORS) {
@@ -323,6 +386,43 @@ const server = http.createServer((req, res) => {
       estado,
       log:           statusLog.slice(0, 20),
     }, null, 2));
+  } else if (req.url.startsWith("/debug-lbank")) {
+    // Verifica directamente contra LBank si el símbolo configurado existe.
+    try {
+      const pairs = await fetchJSON("https://api.lbkex.com/v1/currencyPairs.do");
+      const monitor = MONITORS.find(m => m.exchange === "lbank");
+      const existe = Array.isArray(pairs) && pairs.includes(monitor.symbol);
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({
+        simboloBuscado: monitor.symbol,
+        existeEnLBank: existe,
+        totalParesDevueltos: Array.isArray(pairs) ? pairs.length : 0,
+        paresQueContienen_a: Array.isArray(pairs) ? pairs.filter(p => p.startsWith("a_") || p === "a_usdt") : [],
+        muestraDeRespuesta: Array.isArray(pairs) ? pairs.slice(0, 15) : pairs,
+      }, null, 2));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+  } else if (req.url.startsWith("/backtest")) {
+    // Uso: /backtest?par=xlm|a&tf=1h|4h|1d  (por defecto: xlm, 1h)
+    const u      = new URL(req.url, "http://localhost");
+    const parId  = u.searchParams.get("par") || "xlm";
+    const tfKey  = u.searchParams.get("tf")  || "1h";
+    const monitor = MONITORS.find(m => m.id === parId);
+    if (!monitor || !TF_DEFS[tfKey]) {
+      res.writeHead(400, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ error: "Parámetros inválidos. Usa ?par=xlm|a&tf=1h|4h|1d" }));
+      return;
+    }
+    try {
+      const resultado = await backtestLegs(monitor, tfKey);
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify(resultado, null, 2));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ error: e.message }));
+    }
   } else {
     res.writeHead(404); res.end("Not found");
   }
