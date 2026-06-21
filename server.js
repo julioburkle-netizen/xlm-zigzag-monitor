@@ -40,7 +40,7 @@ let initialized = false;
 let isPolling   = false;
 
 function log(type, msg) {
-  const ts = new Date().toLocaleString("es-AR");
+  const ts = new Date().toLocaleString("es-AR", { timeZone: "America/Argentina/Buenos_Aires" });
   console.log(`[${ts}] [${type}] ${msg}`);
   statusLog.unshift({ ts, type, msg });
   if (statusLog.length > 200) statusLog.pop();
@@ -210,7 +210,7 @@ function buildMsg(monitor, cfg, lp) {
     `${next}\n` +
     `━━━━━━━━━━━━━━━━━━━\n` +
     `ℹ️ ${explica}\n` +
-    `🕐 ${new Date().toLocaleString("es-AR")}`
+    `🕐 ${new Date().toLocaleString("es-AR", { timeZone: "America/Argentina/Buenos_Aires" })}`
   );
 }
 
@@ -306,7 +306,7 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify({
       status:        "corriendo",
       telegramListo: !!TG_TOKEN,
-      lastPoll:      lastPoll?.toLocaleString("es-AR") || "─",
+      lastPoll:      lastPoll?.toLocaleString("es-AR", { timeZone: "America/Argentina/Buenos_Aires" }) || "─",
       uptime:        `${Math.floor(process.uptime() / 60)} min`,
       ciclos:        cycleCount,
       estado,
