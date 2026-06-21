@@ -39,8 +39,19 @@ let cycleCount  = 0;
 let initialized = false;
 let isPolling   = false;
 
+// Formato forzado a 24hs + zona horaria de Argentina explícita, sin depender
+// de defaults del locale (que pueden variar según el motor de Node del host).
+function horaAR(date = new Date()) {
+  return date.toLocaleString("es-AR", {
+    timeZone: "America/Argentina/Buenos_Aires",
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit",
+    hour12: false,
+  });
+}
+
 function log(type, msg) {
-  const ts = new Date().toLocaleString("es-AR", { timeZone: "America/Argentina/Buenos_Aires" });
+  const ts = horaAR();
   console.log(`[${ts}] [${type}] ${msg}`);
   statusLog.unshift({ ts, type, msg });
   if (statusLog.length > 200) statusLog.pop();
@@ -210,7 +221,7 @@ function buildMsg(monitor, cfg, lp) {
     `${next}\n` +
     `━━━━━━━━━━━━━━━━━━━\n` +
     `ℹ️ ${explica}\n` +
-    `🕐 ${new Date().toLocaleString("es-AR", { timeZone: "America/Argentina/Buenos_Aires" })}`
+    `🕐 ${horaAR()}`
   );
 }
 
@@ -306,7 +317,7 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify({
       status:        "corriendo",
       telegramListo: !!TG_TOKEN,
-      lastPoll:      lastPoll?.toLocaleString("es-AR", { timeZone: "America/Argentina/Buenos_Aires" }) || "─",
+      lastPoll:      lastPoll ? horaAR(lastPoll) : "─",
       uptime:        `${Math.floor(process.uptime() / 60)} min`,
       ciclos:        cycleCount,
       estado,
