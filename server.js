@@ -11,25 +11,30 @@ const POLL_MS  = 30 * 1000;
 const PORT     = process.env.PORT || 3000;
 const HTTP_TIMEOUT_MS = 10 * 1000;
 
+const DEFAULT_TF_KEYS = ["1h", "4h", "1d"];
+
 // ══════════════════════════════════════════════════════════════════════
 //   📌 PARES A MONITOREAR — agrega/quita líneas aquí
+//   "tfKeys" es opcional: si no se pone, usa DEFAULT_TF_KEYS (1h/4h/1d)
 // ══════════════════════════════════════════════════════════════════════
 const MONITORS = [
   { id: "xlm", pairLabel: "XLM/USDT",        exchangeLabel: "KuCoin", exchange: "kucoin", symbol: "XLM-USDT" },
-  { id: "a",   pairLabel: "A/USDT (Vaulta)", exchangeLabel: "LBank",  exchange: "lbank",  symbol: "a_usdt"   },
+  { id: "a",   pairLabel: "A/USDT (Vaulta)", exchangeLabel: "LBank",  exchange: "lbank",  symbol: "a_usdt",
+    tfKeys: ["30m", "4h", "1d"] }, // 30min en vez de 1H, más sensible a los pivotes
 ];
 
 // Temporalidades (neutrales) + cuánto histórico pedir al "sembrar" el estado
 const TF_DEFS = {
-  "1h": { label: "1 Hora",  seconds: 3600,  limit: 800 },
-  "4h": { label: "4 Horas", seconds: 14400, limit: 800 },
-  "1d": { label: "Diario",  seconds: 86400, limit: 500 },
+  "30m": { label: "30 Minutos", seconds: 1800,  limit: 800 },
+  "1h":  { label: "1 Hora",     seconds: 3600,  limit: 800 },
+  "4h":  { label: "4 Horas",    seconds: 14400, limit: 800 },
+  "1d":  { label: "Diario",     seconds: 86400, limit: 500 },
 };
 
 // Cómo se llama cada temporalidad en la API de cada exchange
 const TF_NAME = {
-  kucoin: { "1h": "1hour", "4h": "4hour", "1d": "1day" },
-  lbank:  { "1h": "hour1", "4h": "hour4", "1d": "day1" },
+  kucoin: { "30m": "30min",  "1h": "1hour", "4h": "4hour", "1d": "1day" },
+  lbank:  { "30m": "minute30", "1h": "hour1", "4h": "hour4", "1d": "day1" },
 };
 
 let state       = {};   // state["xlm:1h"] = estado persistente del ZigZag para ese par+tf
@@ -291,7 +296,8 @@ async function poll() {
 
   try {
     for (const monitor of MONITORS) {
-      for (const [tfKey, cfg] of Object.entries(TF_DEFS)) {
+      for (const tfKey of (monitor.tfKeys || DEFAULT_TF_KEYS)) {
+        const cfg = TF_DEFS[tfKey];
         try {
           await processTimeframe(monitor, tfKey, cfg);
         } catch (e) {
@@ -301,7 +307,7 @@ async function poll() {
     }
     if (!initialized) {
       initialized = true;
-      log("INFO", `Monitoreando ${MONITORS.map(m => m.pairLabel).join(" · ")} · 1H/4H/Diario · cada 30s`);
+      log("INFO", `Monitoreando ${MONITORS.map(m => m.pairLabel).join(" · ")} · cada 30s`);
     }
   } finally {
     isPolling = false;
@@ -368,8 +374,9 @@ const server = http.createServer(async (req, res) => {
   if (req.url === "/health" || req.url === "/") {
     const estado = [];
     for (const monitor of MONITORS) {
-      for (const [tfKey, cfg] of Object.entries(TF_DEFS)) {
-        const st = state[`${monitor.id}:${tfKey}`];
+      for (const tfKey of (monitor.tfKeys || DEFAULT_TF_KEYS)) {
+        const cfg = TF_DEFS[tfKey];
+        const st  = state[`${monitor.id}:${tfKey}`];
         estado.push({
           par:    `${monitor.pairLabel} (${monitor.exchangeLabel})`,
           tf:     cfg.label,
