@@ -18,9 +18,8 @@ const DEFAULT_TF_KEYS = ["1h", "4h", "1d"];
 //   "tfKeys" es opcional: si no se pone, usa DEFAULT_TF_KEYS (1h/4h/1d)
 // ══════════════════════════════════════════════════════════════════════
 const MONITORS = [
-  { id: "xlm", pairLabel: "XLM/USDT",        exchangeLabel: "KuCoin", exchange: "kucoin", symbol: "XLM-USDT" },
-  { id: "a",   pairLabel: "A/USDT (Vaulta)", exchangeLabel: "LBank",  exchange: "lbank",  symbol: "a_usdt",
-    tfKeys: ["30m", "4h", "1d"] }, // 30min en vez de 1H, más sensible a los pivotes
+  { id: "xlm", pairLabel: "XLM/USDT", exchangeLabel: "KuCoin", exchange: "kucoin", symbol: "XLM-USDT" },
+  { id: "trx", pairLabel: "TRX/USDT", exchangeLabel: "KuCoin", exchange: "kucoin", symbol: "TRX-USDT" },
 ];
 
 // Temporalidades (neutrales) + cuánto histórico pedir al "sembrar" el estado
