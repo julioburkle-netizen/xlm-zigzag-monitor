@@ -18,12 +18,14 @@ const DEFAULT_TF_KEYS = ["1h", "4h", "1d"];
 //   "tfKeys" es opcional: si no se pone, usa DEFAULT_TF_KEYS (1h/4h/1d)
 // ══════════════════════════════════════════════════════════════════════
 const MONITORS = [
-  { id: "xlm", pairLabel: "XLM/USDT", exchangeLabel: "KuCoin", exchange: "kucoin", symbol: "XLM-USDT" },
+  { id: "xlm", pairLabel: "XLM/USDT", exchangeLabel: "KuCoin", exchange: "kucoin", symbol: "XLM-USDT",
+    tfKeys: ["15m", "1h", "4h", "1d"] }, // 15min agregado solo para XLM
   { id: "trx", pairLabel: "TRX/USDT", exchangeLabel: "KuCoin", exchange: "kucoin", symbol: "TRX-USDT" },
 ];
 
 // Temporalidades (neutrales) + cuánto histórico pedir al "sembrar" el estado
 const TF_DEFS = {
+  "15m": { label: "15 Minutos", seconds: 900,   limit: 800 },
   "30m": { label: "30 Minutos", seconds: 1800,  limit: 800 },
   "1h":  { label: "1 Hora",     seconds: 3600,  limit: 800 },
   "4h":  { label: "4 Horas",    seconds: 14400, limit: 800 },
@@ -32,8 +34,8 @@ const TF_DEFS = {
 
 // Cómo se llama cada temporalidad en la API de cada exchange
 const TF_NAME = {
-  kucoin: { "30m": "30min",  "1h": "1hour", "4h": "4hour", "1d": "1day" },
-  lbank:  { "30m": "minute30", "1h": "hour1", "4h": "hour4", "1d": "day1" },
+  kucoin: { "15m": "15min", "30m": "30min", "1h": "1hour", "4h": "4hour", "1d": "1day" },
+  lbank:  { "15m": "minute15", "30m": "minute30", "1h": "hour1", "4h": "hour4", "1d": "day1" },
 };
 
 let state       = {};   // state["xlm:1h"] = estado persistente del ZigZag para ese par+tf
