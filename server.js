@@ -11,16 +11,17 @@ const POLL_MS  = 30 * 1000;
 const PORT     = process.env.PORT || 3000;
 const HTTP_TIMEOUT_MS = 10 * 1000;
 
-const DEFAULT_TF_KEYS = ["1h", "4h", "1d"];
+const DEFAULT_TF_KEYS = ["15m", "1h", "4h", "1d"];
 
 // ══════════════════════════════════════════════════════════════════════
 //   📌 PARES A MONITOREAR — agrega/quita líneas aquí
-//   "tfKeys" es opcional: si no se pone, usa DEFAULT_TF_KEYS (1h/4h/1d)
+//   "tfKeys" es opcional: si no se pone, usa DEFAULT_TF_KEYS (15m/1h/4h/1d)
 // ══════════════════════════════════════════════════════════════════════
 const MONITORS = [
-  { id: "xlm", pairLabel: "XLM/USDT", exchangeLabel: "KuCoin", exchange: "kucoin", symbol: "XLM-USDT",
-    tfKeys: ["15m", "1h", "4h", "1d"] }, // 15min agregado solo para XLM
-  { id: "trx", pairLabel: "TRX/USDT", exchangeLabel: "KuCoin", exchange: "kucoin", symbol: "TRX-USDT" },
+  { id: "xlm",  pairLabel: "XLM/USDT",  exchangeLabel: "KuCoin", exchange: "kucoin", symbol: "XLM-USDT"  },
+  { id: "trx",  pairLabel: "TRX/USDT",  exchangeLabel: "KuCoin", exchange: "kucoin", symbol: "TRX-USDT"  },
+  { id: "tao",  pairLabel: "TAO/USDT",  exchangeLabel: "KuCoin", exchange: "kucoin", symbol: "TAO-USDT"  },
+  { id: "hype", pairLabel: "HYPE/USDT", exchangeLabel: "KuCoin", exchange: "kucoin", symbol: "HYPE-USDT" },
 ];
 
 // Temporalidades (neutrales) + cuánto histórico pedir al "sembrar" el estado
